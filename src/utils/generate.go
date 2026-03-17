@@ -16,6 +16,5 @@ func GenerateID() string {
 	for i := range result {
 		result[i] = charset[r.Intn(len(charset))]
 	}
-
 	return string(result)
 }

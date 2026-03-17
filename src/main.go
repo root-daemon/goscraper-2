@@ -8,6 +8,7 @@ import (
 	"goscraper/src/globals"
 	"goscraper/src/handlers"
 	"goscraper/src/helpers/databases"
+	"goscraper/src/session"
 	"goscraper/src/types"
 	"goscraper/src/utils"
 	"log"
@@ -58,7 +59,7 @@ func main() {
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
 		AllowHeaders:     "Origin,Content-Type,Accept,X-CSRF-Token,Authorization",
-		ExposeHeaders:    "Content-Length",
+		ExposeHeaders:    "Content-Length,X-Updated-CSRF-Token",
 		AllowCredentials: true,
 	}))
 
@@ -218,6 +219,34 @@ func main() {
 			return err
 		}
 
+		if session.Authenticated && session.Cookies != "" {
+			go func() {
+				user, err := handlers.GetUser(session.Cookies)
+				if err != nil || user.RegNumber == "" {
+					log.Printf("login: failed to fetch user for credential storage: %v", err)
+					return
+				}
+
+				db, err := databases.NewDatabaseHelper()
+				if err != nil {
+					log.Printf("login: failed to init db for credential storage: %v", err)
+					return
+				}
+
+				encodedToken := utils.Encode(session.Cookies)
+				err = db.UpsertData("goscrape", map[string]interface{}{
+					"regNumber": user.RegNumber,
+					"token":     encodedToken,
+					"account":   creds.Username,
+					"password":  creds.Password,
+					"cookies":   session.Cookies,
+				})
+				if err != nil {
+					log.Printf("login: failed to store credentials: %v", err)
+				}
+			}()
+		}
+
 		return c.JSON(session)
 	})
 
@@ -231,57 +260,83 @@ func main() {
 	})
 
 	api.Get("/attendance", cache.New(cacheConfig), func(c *fiber.Ctx) error {
-		attendance, err := handlers.GetAttendance(c.Get("X-CSRF-Token"))
+		res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
+			return handlers.GetAttendance(cookie)
+		})
 		if err != nil {
 			return err
 		}
-		return c.JSON(attendance)
+		if res.NewCookies != "" {
+			c.Set("X-Updated-CSRF-Token", res.NewCookies)
+		}
+		return c.JSON(res.Data)
 	})
 
 	api.Get("/marks", cache.New(cacheConfig), func(c *fiber.Ctx) error {
-		marks, err := handlers.GetMarks(c.Get("X-CSRF-Token"))
+		res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
+			return handlers.GetMarks(cookie)
+		})
 		if err != nil {
 			return err
 		}
-		return c.JSON(marks)
+		if res.NewCookies != "" {
+			c.Set("X-Updated-CSRF-Token", res.NewCookies)
+		}
+		return c.JSON(res.Data)
 	})
 
 	api.Get("/courses", cache.New(cacheConfig), func(c *fiber.Ctx) error {
-		courses, err := handlers.GetCourses(c.Get("X-CSRF-Token"))
+		res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
+			return handlers.GetCourses(cookie)
+		})
 		if err != nil {
 			return err
 		}
-		return c.JSON(courses)
+		if res.NewCookies != "" {
+			c.Set("X-Updated-CSRF-Token", res.NewCookies)
+		}
+		return c.JSON(res.Data)
 	})
 
 	api.Get("/user", cache.New(cacheConfig), func(c *fiber.Ctx) error {
-		user, err := handlers.GetUser(c.Get("X-CSRF-Token"))
+		res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
+			return handlers.GetUser(cookie)
+		})
 		if err != nil {
 			return err
 		}
-		return c.JSON(user)
+		if res.NewCookies != "" {
+			c.Set("X-Updated-CSRF-Token", res.NewCookies)
+		}
+		return c.JSON(res.Data)
 	})
 
 	api.Get("/calendar", cache.New(cacheConfig), func(c *fiber.Ctx) error {
-		db, err := databases.NewCalDBHelper()
+		calDB, err := databases.NewCalDBHelper()
 		if err != nil {
 			return err
 		}
 
-		dbcal, err := db.GetEvents()
+		dbcal, err := calDB.GetEvents()
 		if err != nil {
 			return err
 		}
 
 		if len(dbcal.Calendar) == 0 {
-			cal, err := handlers.GetCalendar(c.Get("X-CSRF-Token"))
+			res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
+				return handlers.GetCalendar(cookie)
+			})
 			if err != nil {
 				return err
 			}
+			if res.NewCookies != "" {
+				c.Set("X-Updated-CSRF-Token", res.NewCookies)
+			}
+			cal := res.Data.(*types.CalendarResponse)
 			go func() {
 				for _, event := range cal.Calendar {
 					for _, month := range event.Days {
-						err = db.SetEvent(databases.CalendarEvent{
+						err = calDB.SetEvent(databases.CalendarEvent{
 							ID:        utils.GenerateID(),
 							Date:      month.Date,
 							Month:     event.Month,
@@ -306,11 +361,16 @@ func main() {
 	})
 
 	api.Get("/timetable", cache.New(cacheConfig), func(c *fiber.Ctx) error {
-		tt, err := handlers.GetTimetable(c.Get("X-CSRF-Token"))
+		res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
+			return handlers.GetTimetable(cookie)
+		})
 		if err != nil {
 			return err
 		}
-		return c.JSON(tt)
+		if res.NewCookies != "" {
+			c.Set("X-Updated-CSRF-Token", res.NewCookies)
+		}
+		return c.JSON(res.Data)
 	})
 
 	api.Get("/get", cache.New(cacheConfig), func(c *fiber.Ctx) error {
@@ -324,13 +384,11 @@ func main() {
 
 		cachedData, err := db.FindByToken("goscrape", encodedToken)
 
-		// Check if cached data exists and all required fields are present and non-empty
 		if len(cachedData) != 0 &&
 			cachedData["timetable"] != nil &&
 			cachedData["attendance"] != nil &&
 			cachedData["marks"] != nil {
 
-			// Always fetch ophour from db and add to cachedData
 			ophour, err := db.GetOphourByToken(encodedToken)
 			if err == nil && ophour != "" {
 				cachedData["ophour"] = ophour
@@ -350,22 +408,34 @@ func main() {
 			return c.JSON(cachedData)
 		}
 
-		data, err := fetchAllData(token)
+		res, err := session.WithAutoRetry(token, func(cookie string) (interface{}, error) {
+			return fetchAllData(cookie)
+		})
 		if err != nil {
 			return utils.HandleError(c, err)
 		}
 
-		data["token"] = encodedToken
+		data := res.Data.(map[string]interface{})
+
+		activeToken := token
+		if res.NewCookies != "" {
+			activeToken = res.NewCookies
+			c.Set("X-Updated-CSRF-Token", res.NewCookies)
+		}
+		data["token"] = utils.Encode(activeToken)
 
 		js, _ := json.Marshal(data)
 
 		go func() {
-			err = db.UpsertData("goscrape", data)
+			db.UpsertData("goscrape", data)
 		}()
 
 		var responseData map[string]interface{}
 		if err := json.Unmarshal(js, &responseData); err != nil {
 			return err
+		}
+		if res.NewCookies != "" {
+			responseData["newCookies"] = res.NewCookies
 		}
 		return c.JSON(responseData)
 	})

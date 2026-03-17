@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"goscraper/src/globals"
 	"io"
 	"os"
@@ -194,6 +195,93 @@ func (db *DatabaseHelper) FindByToken(table string, token string) (map[string]in
 	}
 
 	return results[0], nil
+}
+
+type StoredCredentials struct {
+	RegNumber string
+	Account   string
+	Password  string
+	Cookies   string
+}
+
+func (db *DatabaseHelper) GetCredentialsByToken(token string) (*StoredCredentials, error) {
+	var results []map[string]interface{}
+
+	query := map[string]string{
+		"token": token,
+	}
+
+	_, err := db.client.From("goscrape").Select("regNumber,account,password,cookies", "", false).Match(query).ExecuteTo(&results)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(results) == 0 {
+		return nil, nil
+	}
+
+	row := results[0]
+	regNumber, _ := row["regNumber"].(string)
+
+	accountEnc, _ := row["account"].(string)
+	passwordEnc, _ := row["password"].(string)
+	cookiesEnc, _ := row["cookies"].(string)
+
+	if accountEnc == "" || passwordEnc == "" {
+		return nil, nil
+	}
+
+	accountDec, err := db.decrypt(accountEnc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt account: %w", err)
+	}
+
+	passwordDec, err := db.decrypt(passwordEnc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt password: %w", err)
+	}
+
+	var account, password string
+	if err := json.Unmarshal([]byte(accountDec), &account); err != nil {
+		account = accountDec
+	}
+	if err := json.Unmarshal([]byte(passwordDec), &password); err != nil {
+		password = passwordDec
+	}
+
+	var cookies string
+	if cookiesEnc != "" {
+		cookiesDec, err := db.decrypt(cookiesEnc)
+		if err == nil {
+			if err := json.Unmarshal([]byte(cookiesDec), &cookies); err != nil {
+				cookies = cookiesDec
+			}
+		}
+	}
+
+	return &StoredCredentials{
+		RegNumber: regNumber,
+		Account:   account,
+		Password:  password,
+		Cookies:   cookies,
+	}, nil
+}
+
+func (db *DatabaseHelper) UpdateSession(regNumber, newToken, newCookies string) error {
+	encryptedCookies, err := db.encrypt(`"` + newCookies + `"`)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt cookies: %w", err)
+	}
+
+	data := map[string]interface{}{
+		"regNumber":   regNumber,
+		"token":       newToken,
+		"cookies":     encryptedCookies,
+		"lastUpdated": time.Now().UnixNano() / int64(time.Millisecond),
+	}
+
+	_, _, err = db.client.From("goscrape").Upsert(data, "regNumber", "", "").Execute()
+	return err
 }
 
 func (db *DatabaseHelper) GetOphourByToken(token string) (string, error) {
