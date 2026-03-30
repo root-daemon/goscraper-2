@@ -13,13 +13,24 @@ func ConvertHexToHTML(hexString string) string {
 	}
 
 	re := regexp.MustCompile(`\\x([0-9A-Fa-f]{2})`)
-	return re.ReplaceAllStringFunc(hexString, func(match string) string {
-		hex := match[2:] // Remove \x prefix
+	result := re.ReplaceAllStringFunc(hexString, func(match string) string {
+		hex := match[2:]
 		if val, err := strconv.ParseInt(hex, 16, 32); err == nil {
 			return string(rune(val))
 		}
 		return match
 	})
+
+	// Unescape JavaScript string escape sequences so HTML parsers
+	// can process closing tags (<\/div> -> </div>) and whitespace.
+	replacer := strings.NewReplacer(
+		`\/`, `/`,
+		`\n`, "\n",
+		`\t`, "\t",
+		`\r`, "\r",
+		`\\`, `\`,
+	)
+	return replacer.Replace(result)
 }
 
 func DecodeHTMLEntities(encodedString string) string {

@@ -11,14 +11,15 @@ import (
 )
 
 func GetUser(rawPage string) (*types.User, error) {
-	page := strings.Split(rawPage, `<table border="0" align="left" cellpadding="1" cellspacing="1" style="width:900px;">`)[1]
-	page = strings.Split(page, "</table>")[0]
-
-	page = `<table border="0" align="left" cellpadding="1" cellspacing="1" style="width:900px;">` + page + "</table>"
-
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(page))
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(rawPage))
 	if err != nil {
 		log.Printf("UserHelper.GetUser: failed to parse HTML - %v", err)
+		return &types.User{}, nil
+	}
+
+	table := doc.Find(`table[border="0"][align="left"][cellpadding="1"][cellspacing="1"]`).First()
+	if table.Length() == 0 {
+		log.Printf("UserHelper.GetUser: user info table not found")
 		return &types.User{}, nil
 	}
 
@@ -33,7 +34,7 @@ func GetUser(rawPage string) (*types.User, error) {
 
 	data.Year = getYear(data.RegNumber)
 
-	doc.Find("tr").Each(func(i int, row *goquery.Selection) {
+	table.Find("tr").Each(func(i int, row *goquery.Selection) {
 		cells := row.Find("td")
 		for i := 0; i < cells.Length(); i += 2 {
 			key := cells.Eq(i).Text()

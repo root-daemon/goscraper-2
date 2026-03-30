@@ -3,6 +3,7 @@ package helpers
 import (
 	"errors"
 	"fmt"
+	"goscraper/src/globals"
 	"goscraper/src/types"
 	"goscraper/src/utils"
 	"log"
@@ -50,7 +51,7 @@ func (a *AcademicsFetch) getHTML() (string, error) {
 	req.Header.Set("sec-gpc", "1")
 	req.Header.Set("cookie", a.cookie)
 
-	if err := fasthttp.Do(req, resp); err != nil {
+	if err := globals.HttpClient.Do(req, resp); err != nil {
 		return "", fmt.Errorf("failed to fetch HTML: %v", err)
 	}
 
@@ -122,10 +123,6 @@ func (a *AcademicsFetch) ScrapeAttendance(html string) (*types.AttendanceRespons
 	re := regexp.MustCompile(`RA2\d{12}`)
 	regNumber := re.FindString(html)
 	html = strings.ReplaceAll(html, "<td  bgcolor='#E6E6FA' style='text-align:center'> - </td>", "")
-	html = strings.Split(html, `<table style="font-size :16px;" border="1" align="center" cellpadding="1" cellspacing="1" bgcolor="#FAFAD2">`)[1]
-	html = strings.Split(html, "</table>")[0]
-
-	html = `<table style="font-size :16px;" border="1" align="center" cellpadding="1" cellspacing="1" bgcolor="#FAFAD2">` + html + "</table>"
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
@@ -136,12 +133,21 @@ func (a *AcademicsFetch) ScrapeAttendance(html string) (*types.AttendanceRespons
 		}, nil
 	}
 
-	rows := doc.Find("td[bgcolor='#E6E6FA']").FilterFunction(func(i int, s *goquery.Selection) bool {
+	table := doc.Find(`table[bgcolor="#FAFAD2"]`).First()
+	if table.Length() == 0 {
+		log.Printf("AttendanceHelper.ScrapeAttendance: attendance table (bgcolor=#FAFAD2) not found")
+		return &types.AttendanceResponse{
+			RegNumber:  regNumber,
+			Attendance: []types.Attendance{},
+			Status:     200,
+		}, nil
+	}
+
+	rows := table.Find("td[bgcolor='#E6E6FA']").FilterFunction(func(i int, s *goquery.Selection) bool {
 		return s.Text() != " - "
 	})
 
 	if rows.Length() == 0 {
-		// fmt.Println("No attendance data found")
 		return &types.AttendanceResponse{RegNumber: regNumber, Attendance: []types.Attendance{}}, nil
 	}
 
@@ -202,9 +208,35 @@ func (a *AcademicsFetch) ScrapeMarks(html string) (*types.MarksResponse, error) 
 	}
 
 	var marks []types.Mark
-	html = strings.Split(html, `<table border="1" align="center" cellpadding="1" cellspacing="1">`)[1]
-	html = strings.Split(html, `<table  width=800px;"border="0"cellspacing="1"cellpadding="1">`)[0]
-	html = strings.Split(html, `<br />`)[0]
+
+	tableTagRe := regexp.MustCompile(`<table[^>]+>`)
+	allTables := tableTagRe.FindAllStringIndex(html, -1)
+	marksTableIdx := -1
+	for _, loc := range allTables {
+		tag := html[loc[0]:loc[1]]
+		if strings.Contains(tag, `border="1"`) &&
+			strings.Contains(tag, `cellpadding="1"`) &&
+			strings.Contains(tag, `cellspacing="1"`) &&
+			strings.Contains(tag, `align="center"`) &&
+			!strings.Contains(tag, "bgcolor") {
+			marksTableIdx = loc[1]
+			break
+		}
+	}
+
+	if marksTableIdx == -1 {
+		log.Printf("AttendanceHelper.ScrapeMarks: marks table not found in HTML")
+		return &types.MarksResponse{
+			RegNumber: attResp.RegNumber,
+			Marks:     []types.Mark{},
+			Status:    200,
+		}, nil
+	}
+
+	html = html[marksTableIdx:]
+	if parts := strings.SplitN(html, `<br />`, 2); len(parts) > 1 {
+		html = parts[0]
+	}
 
 	html = `<table border="1" align="center" cellpadding="1" cellspacing="1">` + html
 

@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"fmt"
+	"goscraper/src/globals"
 	"goscraper/src/types"
 	"goscraper/src/utils"
 	"log"
@@ -54,7 +55,7 @@ func (c *CoursePage) GetPage() (string, error) {
 	req.Header.Set("sec-ch-ua-platform", `"macOS"`)
 	req.Header.Set("sec-gpc", "1")
 
-	if err := fasthttp.Do(req, resp); err != nil {
+	if err := globals.HttpClient.Do(req, resp); err != nil {
 		return "", fmt.Errorf("failed to fetch page: %v", err)
 	}
 
@@ -87,23 +88,9 @@ func (c *CoursePage) GetCourses() (*types.CourseResponse, error) {
 	re := regexp.MustCompile(`RA2\d{12}`)
 	regNumber := re.FindString(page)
 
-	htmlParts := strings.Split(page, `<table cellspacing="1" cellpadding="1" border="1" align="center" style="width:900px!important;" class="course_tbl">`)
-	if len(htmlParts) < 2 {
-		log.Printf("CourseHelper.GetCourses: failed to find course table in the page")
-		return &types.CourseResponse{
-			Status:  500,
-			Error:   "failed to find course table in the page",
-			Courses: []types.Course{},
-		}, nil
-	}
-	html := htmlParts[1]
-	html = strings.Split(html, "</table>")[0]
-
-	html = `<table style="font-size :16px;" border="1" align="center" cellpadding="1" cellspacing="1" bgcolor="#FAFAD2"><tbody>` + html + "</tbody></table>"
-
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(page))
 	if err != nil {
-		log.Printf("CourseHelper.GetCourses: failed to parse HTML - %v", err)
+		log.Printf("CourseHelper.GetCourses: failed to parse page HTML - %v", err)
 		return &types.CourseResponse{
 			Status:  500,
 			Error:   fmt.Sprintf("failed to parse HTML: %v", err),
@@ -111,8 +98,18 @@ func (c *CoursePage) GetCourses() (*types.CourseResponse, error) {
 		}, nil
 	}
 
+	table := doc.Find(`table.course_tbl`).First()
+	if table.Length() == 0 {
+		log.Printf("CourseHelper.GetCourses: course table (.course_tbl) not found")
+		return &types.CourseResponse{
+			Status:  500,
+			Error:   "failed to find course table in the page",
+			Courses: []types.Course{},
+		}, nil
+	}
+
 	var courses []types.Course
-	rows := doc.Find("tr")
+	rows := table.Find("tr")
 
 	rows.Each(func(i int, row *goquery.Selection) {
 		if i == 0 {
