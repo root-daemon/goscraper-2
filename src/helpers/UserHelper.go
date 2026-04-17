@@ -55,10 +55,12 @@ func GetUser(rawPage string) (*types.User, error) {
 			case "Department":
 				arr := strings.Split(value, "-")
 				data.Department = strings.TrimSpace(arr[0])
-				section := strings.TrimSpace(arr[1])
-				section = strings.TrimPrefix(section, "(")
-				section = strings.TrimSuffix(section, " Section)")
-				data.Section = section
+				if len(arr) > 1 {
+					section := strings.TrimSpace(arr[1])
+					section = strings.TrimPrefix(section, "(")
+					section = strings.TrimSuffix(section, " Section)")
+					data.Section = section
+				}
 			}
 		}
 	})

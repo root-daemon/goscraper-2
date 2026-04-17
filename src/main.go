@@ -23,7 +23,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/etag"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
-	"github.com/gofiber/fiber/v2/middleware/recover"
+	fiberrecover "github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
 )
 
@@ -43,7 +43,7 @@ func main() {
 		},
 	})
 
-	app.Use(recover.New())
+	app.Use(fiberrecover.New())
 	app.Use(compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))
@@ -221,6 +221,11 @@ func main() {
 
 		if session.Authenticated && session.Cookies != "" {
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("login: background goroutine panic: %v", r)
+					}
+				}()
 				user, err := handlers.GetUser(session.Cookies)
 				if err != nil || user.RegNumber == "" {
 					log.Printf("login: failed to fetch user for credential storage: %v", err)
@@ -395,6 +400,11 @@ func main() {
 			}
 
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("/get: background refresh panic: %v", r)
+					}
+				}()
 				data, err := fetchAllData(token)
 				if err != nil {
 					return
@@ -427,6 +437,11 @@ func main() {
 		js, _ := json.Marshal(data)
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("/get: background upsert panic: %v", r)
+				}
+			}()
 			db.UpsertData("goscrape", data)
 		}()
 

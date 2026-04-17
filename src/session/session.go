@@ -68,7 +68,11 @@ func isSessionExpiredError(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "invalid response format") ||
-		strings.Contains(msg, "invalid token format")
+		strings.Contains(msg, "invalid token format") ||
+		strings.Contains(msg, "server returned status 301") ||
+		strings.Contains(msg, "server returned status 302") ||
+		strings.Contains(msg, "server returned status 401") ||
+		strings.Contains(msg, "server returned status 403")
 }
 
 func WithAutoRetry(cookie string, fn func(string) (interface{}, error)) (*RetryResult, error) {
