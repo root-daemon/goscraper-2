@@ -21,6 +21,8 @@ type LoginResponse struct {
 	Message       any                    `json:"message"`
 	Errors        []string               `json:"errors"`
 	Captcha       *CaptchaData           `json:"captcha,omitempty"`
+	SPCaptcha     *SPCaptchaData         `json:"spCaptcha,omitempty"`
+	SPCookies     string                 `json:"spCookies,omitempty"`
 }
 
 type CaptchaData struct {

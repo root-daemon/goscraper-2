@@ -31,6 +31,23 @@ create table public.goscrape (
 );
 ```
 
+#### Create the `sp_scrape` table:
+Stores sp.srmist.edu.in (student portal) sessions and scraped data.
+```sql
+create table public.sp_scrape (
+  netid text not null,
+  "regNumber" text null,
+  account text null,
+  password text null,
+  cookies text null,
+  token text null,
+  attendance text null,
+  marks text null,
+  "lastUpdated" bigint null default 0,
+  constraint sp_scrape_pkey primary key (netid)
+);
+```
+
 #### Create the `gocal` table:
 ```sql 
 create table public.gocal (

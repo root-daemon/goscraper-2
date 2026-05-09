@@ -59,7 +59,7 @@ func main() {
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
 		AllowHeaders:     "Origin,Content-Type,Accept,X-CSRF-Token,Authorization",
-		ExposeHeaders:    "Content-Length,X-Updated-CSRF-Token",
+		ExposeHeaders:    "Content-Length,X-Updated-CSRF-Token,X-Updated-SP-Token",
 		AllowCredentials: true,
 	}))
 
@@ -194,10 +194,12 @@ func main() {
 
 	app.Post("/login", func(c *fiber.Ctx) error {
 		var creds struct {
-			Username string  `json:"account"`
-			Password string  `json:"password"`
-			Cdigest  *string `json:"cdigest,omitempty"`
-			Captcha  *string `json:"captcha,omitempty"`
+			Username  string  `json:"account"`
+			Password  string  `json:"password"`
+			Cdigest   *string `json:"cdigest,omitempty"`
+			Captcha   *string `json:"captcha,omitempty"`
+			SPState   *string `json:"spState,omitempty"`
+			SPCaptcha *string `json:"spCaptcha,omitempty"`
 		}
 
 		if err := c.BodyParser(&creds); err != nil {
@@ -214,12 +216,66 @@ func main() {
 		}
 
 		lf := &handlers.LoginFetcher{}
+		spLf := &handlers.SPLoginFetcher{}
+
+		// Phase 1: client has not yet solved the SP captcha. Probe academia
+		// so the client gets the academia captcha if needed, fetch a fresh SP
+		// captcha, and return both for a single user-facing prompt.
+		if creds.SPState == nil || *creds.SPState == "" {
+			session, err := lf.Login(creds.Username, creds.Password, creds.Cdigest, creds.Captcha)
+			if err != nil {
+				return err
+			}
+
+			// Hard auth failure (wrong creds, etc.) — surface immediately, skip SP.
+			if !session.Authenticated && session.Captcha == nil {
+				return c.JSON(session)
+			}
+
+			spCap, err := spLf.Init()
+			if err != nil {
+				log.Printf("login phase1: SP init failed: %v", err)
+				// Degrade gracefully to academia-only response.
+				return c.JSON(session)
+			}
+			session.SPCaptcha = spCap
+			// Even if academia already authenticated, hold the response until
+			// the SP captcha is solved so the coupled flow returns one success.
+			session.Authenticated = false
+			return c.JSON(session)
+		}
+
+		// Phase 2: client has supplied SP captcha + state. Complete academia
+		// (idempotent) and SP, then return both cookies on success.
 		session, err := lf.Login(creds.Username, creds.Password, creds.Cdigest, creds.Captcha)
 		if err != nil {
 			return err
 		}
+		if !session.Authenticated {
+			// Academia still incomplete — refresh SP captcha so the next attempt isn't stuck.
+			if spCap, ierr := spLf.Init(); ierr == nil {
+				session.SPCaptcha = spCap
+			}
+			return c.JSON(session)
+		}
 
-		if session.Authenticated && session.Cookies != "" {
+		spResult, err := spLf.Complete(creds.Username, creds.Password, derefStr(creds.SPCaptcha), *creds.SPState)
+		if err != nil {
+			return err
+		}
+		if !spResult.Authenticated {
+			spCap, _ := spLf.Init()
+			return c.JSON(&handlers.LoginResponse{
+				Authenticated: false,
+				Status:        spResult.Status,
+				Message:       spResult.Message,
+				Cookies:       session.Cookies,
+				SPCaptcha:     spCap,
+			})
+		}
+		session.SPCookies = spResult.Cookies
+
+		if session.Cookies != "" {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -248,6 +304,25 @@ func main() {
 				})
 				if err != nil {
 					log.Printf("login: failed to store credentials: %v", err)
+				}
+
+				if session.SPCookies != "" {
+					spDB, err := databases.NewSPDatabaseHelper()
+					if err != nil {
+						log.Printf("login: failed to init sp db: %v", err)
+						return
+					}
+					netid := strings.SplitN(creds.Username, "@", 2)[0]
+					if err := spDB.UpsertSession(databases.SPStoredSession{
+						NetID:     netid,
+						Account:   creds.Username,
+						Password:  creds.Password,
+						Cookies:   session.SPCookies,
+						Token:     utils.Encode(session.SPCookies),
+						RegNumber: user.RegNumber,
+					}); err != nil {
+						log.Printf("login: failed to store sp session: %v", err)
+					}
 				}
 			}()
 		}
@@ -365,6 +440,83 @@ func main() {
 
 	})
 
+	// SP (sp.srmist.edu.in) routes — separate session, X-SP-Token header.
+	// Requires the academia X-CSRF-Token middleware to have passed (coupled login),
+	// then validates the SP cookie string the client sends back.
+	spCacheConfig := cache.Config{
+		Next: func(c *fiber.Ctx) bool {
+			return c.Method() != "GET"
+		},
+		Expiration: 2 * time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.Path() + "_" + c.Get("X-SP-Token")
+		},
+	}
+
+	api.Get("/sp/probe", func(c *fiber.Ctx) error {
+		spToken := c.Get("X-SP-Token")
+		if spToken == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Missing X-SP-Token header",
+			})
+		}
+		res, err := handlers.SPProbe(spToken)
+		if err != nil {
+			return err
+		}
+		if res.NewCookies != "" {
+			c.Set("X-Updated-SP-Token", res.NewCookies)
+		}
+		if !res.Authenticated {
+			return c.Status(fiber.StatusUnauthorized).JSON(res)
+		}
+		return c.JSON(res)
+	})
+
+	api.Get("/sp/marks", cache.New(spCacheConfig), func(c *fiber.Ctx) error {
+		spToken := c.Get("X-SP-Token")
+		if spToken == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Missing X-SP-Token header",
+			})
+		}
+		res, err := handlers.GetSPMarks(spToken)
+		if err != nil {
+			return err
+		}
+		if res.NewCookies != "" {
+			c.Set("X-Updated-SP-Token", res.NewCookies)
+		}
+		if res.Expired {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "SP session expired",
+			})
+		}
+		return c.JSON(res)
+	})
+
+	api.Get("/sp/attendance", cache.New(spCacheConfig), func(c *fiber.Ctx) error {
+		spToken := c.Get("X-SP-Token")
+		if spToken == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Missing X-SP-Token header",
+			})
+		}
+		res, err := handlers.GetSPAttendance(spToken)
+		if err != nil {
+			return err
+		}
+		if res.NewCookies != "" {
+			c.Set("X-Updated-SP-Token", res.NewCookies)
+		}
+		if res.Expired {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "SP session expired",
+			})
+		}
+		return c.JSON(res)
+	})
+
 	api.Get("/timetable", cache.New(cacheConfig), func(c *fiber.Ctx) error {
 		res, err := session.WithAutoRetry(c.Get("X-CSRF-Token"), func(cookie string) (interface{}, error) {
 			return handlers.GetTimetable(cookie)
@@ -470,6 +622,13 @@ func main() {
 	if err := app.Listener(ln); err != nil {
 		log.Printf("Server error: %+v", err)
 	}
+}
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func fetchAllData(token string) (map[string]interface{}, error) {
