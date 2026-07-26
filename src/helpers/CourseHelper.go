@@ -24,8 +24,12 @@ func NewCoursePage(cookie string) *CoursePage {
 	}
 }
 
+// myTimeTableURL is the Academia page that currently hosts personal courses,
+// batch, and profile details (still served under the 2023_24 page name).
+const myTimeTableURL = "https://academia.srmist.edu.in/srm_university/academia-academic-services/page/My_Time_Table_2023_24"
+
 func (c *CoursePage) getUrl() string {
-	return "https://academia.srmist.edu.in/srm_university/academia-academic-services/page/My_Time_Table_2023_24"
+	return myTimeTableURL
 }
 
 func (c *CoursePage) GetPage() (string, error) {

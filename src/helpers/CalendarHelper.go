@@ -6,6 +6,7 @@ import (
 	"goscraper/src/types"
 	"goscraper/src/utils"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,12 +15,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-func init() {
-	// Load .env file from the project root
-	// if err := godotenv.Load(); err != nil {
-	//     fmt.Printf("Warning: .env file not found: %v\n", err)
-	// }
-}
+const academiaPageBase = "https://academia.srmist.edu.in/srm_university/academia-academic-services/page/"
 
 type CalendarFetcher struct {
 	cookie string
@@ -34,61 +30,175 @@ func NewCalendarFetcher(date time.Time, cookie string) *CalendarFetcher {
 }
 
 func (c *CalendarFetcher) GetCalendar() (*types.CalendarResponse, error) {
+	var lastErr string
+	urls := calendarPageURLs(c.date)
+
+	for i := 0; i < len(urls); i++ {
+		url := urls[i]
+		body, status, err := c.fetchPlannerPage(url)
+		if err != nil {
+			lastErr = err.Error()
+			log.Printf("CalendarHelper.GetCalendar: %s -> %v", url, err)
+			continue
+		}
+		if status != fasthttp.StatusOK {
+			lastErr = fmt.Sprintf("HTTP %d for %s", status, url)
+			log.Printf("CalendarHelper.GetCalendar: %s", lastErr)
+			continue
+		}
+
+		// Academic_Reports may embed the planner table or link to Academic_Planner_* pages.
+		for _, discovered := range discoverPlannerURLs(body) {
+			urls = appendUniqueURL(urls, discovered)
+		}
+
+		calendar, err := c.parseCalendar(body)
+		if err != nil {
+			lastErr = err.Error()
+			log.Printf("CalendarHelper.GetCalendar: parse failed for %s - %v", url, err)
+			continue
+		}
+		if len(calendar.Calendar) == 0 {
+			lastErr = fmt.Sprintf("empty calendar from %s", url)
+			log.Printf("CalendarHelper.GetCalendar: %s", lastErr)
+			continue
+		}
+
+		log.Printf("CalendarHelper.GetCalendar: using page %s", url)
+		calendar.Status = status
+		return calendar, nil
+	}
+
+	if lastErr == "" {
+		lastErr = "no academic calendar URL succeeded"
+	}
+	return &types.CalendarResponse{
+		Error:    true,
+		Message:  lastErr,
+		Status:   500,
+		Calendar: []types.CalendarMonth{},
+	}, nil
+}
+
+// calendarPageURLs prefers the stable Academic_Reports page (browser hash
+// #Academic_Reports), then related report pages, then term-named planners.
+func calendarPageURLs(now time.Time) []string {
+	seen := make(map[string]bool)
+	var urls []string
+	add := func(list ...string) {
+		for _, u := range list {
+			if !seen[u] {
+				seen[u] = true
+				urls = append(urls, u)
+			}
+		}
+	}
+
+	add(
+		academiaPageBase+"Academic_Reports",
+		academiaPageBase+"Academic_Reports_Unified",
+		academiaPageBase+"Academic_Calendar",
+		academiaPageBase+"Day_Order",
+	)
+
+	year := now.Year()
+	month := int(now.Month())
+	isOdd := month >= 6
+	academicYear := year
+	if !isOdd {
+		academicYear = year - 1
+	}
+
+	build := func(y int, term string) []string {
+		shortNext := fmt.Sprintf("%02d", (y+1)%100)
+		return []string{
+			academiaPageBase + fmt.Sprintf("Academic_Planner_%d_%s_%s", y, shortNext, term),
+			academiaPageBase + fmt.Sprintf("Academic_Planner_%d_%d_%s", y, y+1, term),
+		}
+	}
+
+	primary := "ODD"
+	secondary := "EVEN"
+	if !isOdd {
+		primary, secondary = "EVEN", "ODD"
+	}
+
+	add(build(academicYear, primary)...)
+	add(build(academicYear, secondary)...)
+	add(build(academicYear+1, "ODD")...)
+	add(build(academicYear+1, "EVEN")...)
+	add(build(academicYear-1, "EVEN")...)
+	add(build(academicYear-1, "ODD")...)
+	add(academiaPageBase + "Academic_Planner")
+	return urls
+}
+
+var plannerLinkPattern = regexp.MustCompile(`Academic_Planner_[A-Za-z0-9_]+`)
+
+func discoverPlannerURLs(raw string) []string {
+	decoded := utils.ConvertHexToHTML(raw)
+	matches := plannerLinkPattern.FindAllString(decoded, -1)
+	if len(matches) == 0 {
+		matches = plannerLinkPattern.FindAllString(raw, -1)
+	}
+	seen := make(map[string]bool)
+	var urls []string
+	for _, name := range matches {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		urls = append(urls, academiaPageBase+name)
+	}
+	return urls
+}
+
+func appendUniqueURL(urls []string, url string) []string {
+	for _, existing := range urls {
+		if existing == url {
+			return urls
+		}
+	}
+	return append(urls, url)
+}
+
+func (c *CalendarFetcher) fetchPlannerPage(url string) (string, int, error) {
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(resp)
 
-	req.SetRequestURI("https://academia.srmist.edu.in/srm_university/academia-academic-services/page/Academic_Planner_2025_26_EVEN")
+	req.SetRequestURI(url)
 	req.Header.SetMethod("GET")
-	req.Header.Set("accept", "*/*")
-	req.Header.Set("accept-language", "en-US,en;q=0.9")
-	req.Header.Set("content-type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("cookie", fmt.Sprintf("ZCNEWUIPUBLICPORTAL=true; cli_rgn=IN; %s", utils.ExtractCookies(c.cookie)))
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	// Use the full session cookie (same as timetable/courses). ExtractCookies-only
+	// requests often get 403 on planner pages.
+	req.Header.Set("cookie", c.cookie)
 	req.Header.Set("Referer", "https://academia.srmist.edu.in/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Cache-Control", "public, max-age=3600, stale-while-revalidate=7200")
 
 	if err := globals.HttpClient.Do(req, resp); err != nil {
-		log.Printf("CalendarHelper.GetCalendar: failed to fetch calendar - %v", err)
-		return &types.CalendarResponse{
-			Error:    true,
-			Message:  err.Error(),
-			Status:   500,
-			Calendar: []types.CalendarMonth{},
-		}, nil
+		return "", 0, err
 	}
-
-	statusCode := resp.StatusCode()
-	if statusCode != fasthttp.StatusOK {
-		log.Printf("CalendarHelper.GetCalendar: server returned status %d", statusCode)
-		return &types.CalendarResponse{
-			Error:    true,
-			Message:  fmt.Sprintf("HTTP error: %d", statusCode),
-			Status:   statusCode,
-			Calendar: []types.CalendarMonth{},
-		}, nil
-	}
-
-	calendar, err := c.parseCalendar(string(resp.Body()))
-	if err != nil {
-		log.Printf("CalendarHelper.GetCalendar: failed to parse calendar - %v", err)
-		return &types.CalendarResponse{
-			Error:    true,
-			Message:  err.Error(),
-			Status:   500,
-			Calendar: []types.CalendarMonth{},
-		}, nil
-	}
-
-	calendar.Status = statusCode
-	return calendar, nil
+	return string(resp.Body()), resp.StatusCode(), nil
 }
 
 func (c *CalendarFetcher) parseCalendar(html string) (*types.CalendarResponse, error) {
 	var htmlText string
 	if strings.Contains(html, "<table bgcolor=") {
 		htmlText = html
+	} else if parts := strings.Split(html, ".sanitize('"); len(parts) >= 2 {
+		htmlHex := strings.Split(parts[1], "')")[0]
+		htmlText = utils.ConvertHexToHTML(htmlHex)
 	} else {
 		parts := strings.Split(html, "zmlvalue=\"")
 		if len(parts) < 2 {
@@ -153,10 +263,8 @@ func (c *CalendarFetcher) parseCalendar(html string) (*types.CalendarResponse, e
 		}
 	})
 
-	// Sort the calendar data
 	sortedData := SortCalendarData(data)
 
-	// Find current month entry
 	monthNames := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 	currentMonthName := monthNames[c.date.Month()-1]
 
@@ -170,7 +278,7 @@ func (c *CalendarFetcher) parseCalendar(html string) (*types.CalendarResponse, e
 		}
 	}
 
-	if monthEntry.Month == "" {
+	if monthEntry.Month == "" && len(sortedData) > 0 {
 		monthEntry = sortedData[0]
 		monthIndex = 0
 	}
@@ -181,18 +289,14 @@ func (c *CalendarFetcher) parseCalendar(html string) (*types.CalendarResponse, e
 		if todayIndex >= 0 && todayIndex < len(monthEntry.Days) {
 			today = &monthEntry.Days[todayIndex]
 
-			// Get tomorrow's date
 			tomorrowIndex := todayIndex + 1
 			if tomorrowIndex < len(monthEntry.Days) {
 				tomorrow = &monthEntry.Days[tomorrowIndex]
 			} else if monthIndex+1 < len(sortedData) && len(sortedData[monthIndex+1].Days) > 0 {
-				// If tomorrow is in the next month
 				tomorrow = &sortedData[monthIndex+1].Days[0]
 			}
 		}
 	}
-
-	// fmt.Println(today, tomorrow)
 
 	return &types.CalendarResponse{
 		Today:    today,
